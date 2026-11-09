@@ -3,7 +3,7 @@ import bodyParser from "body-parser";
 import cors from "cors";
 import userRout from "./routes/userRout.js";
 import sequelize from "./dbconnection.js";
-import path, { dirname, join } from "path";
+import path, { dirname } from "path";
 import { fileURLToPath } from "url";
 import cookieParser from "cookie-parser";
 import CustomerRoute from "./routes/CustomersRoute.js";
@@ -26,7 +26,10 @@ import SellerAccountRoute from "./routes/Seller/SellerAccountRoute.js";
 import PayRoute from "./routes/finance/PayRoute.js";
 import FactorRouter from "./routes/finance/FactorRouter.js";
 import databaseRoute from "./routes/databaseRoute.js";
-const FRONT_URL = process.env.FRONT_URL
+import mysql from "mysql2/promise";
+import OpenAI from "openai";
+
+const FRONT_URL = process.env.FRONT_URL;
 const port = 8038;
 const app = express();
 
@@ -41,7 +44,7 @@ const walletRoutes = (await import("./routes/debt/routes/walletRoutes.js")).defa
 
 // ✅ Configure CORS properly
 const allowedOrigins = [
-  `${FRONT_URL}`, // React local dev
+  `${FRONT_URL}`,
   "http://localhost:3000",
 ];
 
@@ -54,7 +57,7 @@ app.use(
         callback(new Error("CORS policy: Access denied from this origin."));
       }
     },
-    credentials: true, // allow cookies and auth headers
+    credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
@@ -99,14 +102,117 @@ app.use("/pays", PayRoute);
 app.use("/factors", FactorRouter);
 app.use("/database", databaseRoute);
 
-
 app.use("/employees", employeeRoutes);
 app.use("/loans", loanRoutes);
 app.use("/payments", paymentRoutes);
 app.use("/reports", reportRoutes);
 app.use("/wallets", walletRoutes);
 
+// ============================================================
+// 🤖 AI Chat Pipeline (replaces datalogue)
+// ============================================================
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// ⚠️ REPLACE these with the real table names from your database
+const ALLOWED_TABLES = [
+  "orderitems",
+  "customers",
+  "remain",
+  "companystocks",
+  "pallets",
+];
+
+// Read the schema of only the allowed tables
+async function getSchema() {
+  const connection = await mysql.createConnection(process.env.DATABASE_URL);
+  try {
+    const placeholders = ALLOWED_TABLES.map(() => "?").join(",");
+    const [columns] = await connection.execute(
+      `SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
+       FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME IN (${placeholders})`,
+      ALLOWED_TABLES
+    );
+
+    const grouped = {};
+    for (const c of columns) {
+      if (!grouped[c.TABLE_NAME]) grouped[c.TABLE_NAME] = [];
+      grouped[c.TABLE_NAME].push(`${c.COLUMN_NAME} (${c.DATA_TYPE})`);
+    }
+
+    return Object.entries(grouped)
+      .map(([table, cols]) => `Table ${table}:\n  ${cols.join("\n  ")}`)
+      .join("\n\n");
+  } finally {
+    await connection.end();
+  }
+}
+
+// Very lightweight SQL safety check
+function isSafeSelect(sql) {
+  const cleaned = sql.trim().toLowerCase();
+  if (!cleaned.startsWith("select") && !cleaned.startsWith("with")) return false;
+  const forbidden = ["insert", "update", "delete", "drop", "alter", "truncate", "create", "grant"];
+  return !forbidden.some((word) => new RegExp(`\\b${word}\\b`, "i").test(cleaned));
+}
+
+app.post("/query", async (req, res) => {
+  const { query } = req.body;
+  if (!query) {
+    return res.status(400).json({ error: "Query is required" });
+  }
+
+  try {
+    // 1. Get schema
+    const schema = await getSchema();
+
+    // 2. Ask OpenAI to generate SQL
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a MySQL expert. Convert the user's question into a single MySQL SELECT query " +
+            "using ONLY the tables and columns listed below. " +
+            "Return ONLY the raw SQL, no markdown, no explanation.\n\n" +
+            "Schema:\n" +
+            schema,
+        },
+        { role: "user", content: query },
+      ],
+    });
+
+    let sql = completion.choices[0].message.content.trim();
+    sql = sql.replace(/^```sql\s*/i, "").replace(/```$/i, "").trim();
+
+    // 3. Safety validation
+    if (!isSafeSelect(sql)) {
+      return res.status(403).json({ error: "Only SELECT queries are allowed.", sql });
+    }
+
+    // 4. Execute
+    const connection = await mysql.createConnection(process.env.DATABASE_URL);
+    let rows;
+    try {
+      [rows] = await connection.execute(sql);
+    } finally {
+      await connection.end();
+    }
+
+    res.json({ sql, rows });
+  } catch (error) {
+    console.error("AI query error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
 // Sync database and start server
+// ============================================================
 sequelize
   .sync({ alter: false })
   .then(() => {

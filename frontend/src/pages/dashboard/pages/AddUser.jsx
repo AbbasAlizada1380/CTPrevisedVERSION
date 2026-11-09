@@ -2,7 +2,9 @@ import React, { useState, useEffect } from "react";
 import Swal from "sweetalert2";
 import { createUser, getUsers } from "../services/UserServices";
 import { LuUsers } from "react-icons/lu";
+import { QueryBox } from 'datalogue-react';
 
+const BASE_URL = import.meta.env.VITE_BASE_URL;
 const AddUser = () => {
   const [form, setForm] = useState({
     fullname: "",
@@ -603,6 +605,13 @@ const AddUser = () => {
           </div>
         </div>
       </div>
+
+      <QueryBox
+        endpoint={`${BASE_URL}/query`}
+        transformRequest={(body) => ({
+          query: body.query || body.message || body.input || body.question,
+        })}
+      />
     </div>
   );
 };
